@@ -5,7 +5,7 @@
 注释中的尺寸均为原图像素；灰度阈值使用 0～255 灰度单位。
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from math import ceil, isfinite
 from typing import Literal
 
@@ -24,9 +24,9 @@ class WaferGeometry:
 
 @dataclass(frozen=True)
 class DetectorConfig:
-    """第一版的起始参数；现场阈值仍需用厂内确认正常的图校准。
+    """显式构造时保留通用灵敏参数；真实图请从 for_real_samples() 开始。
 
-    angular_sigma_px: 沿圆周的背景平滑尺度，大于目标缺陷宽度。
+    angular_sigma_px: 沿圆周背景平滑的标准差，按弧长像素计量，不是窗口边长。
     radial_step_px: 背景径向采样间隔，不是圆环宽度。
     noise_floor: 噪声标准差的下限，防止平坦区域的分数异常放大。
     seed_score: 多尺度响应的种子阈值，分数不是缺陷概率。
@@ -54,6 +54,24 @@ class DetectorConfig:
     min_peak_contrast: float = 8.0
     min_area: int = 3
     max_area: int | None = 200
+    # 0 关闭第二种背景的交叉检查；真实图配置使用 5×5 局部中值背景。
+    confirmation_ksize: int = 0
+    confirmation_min_mean: float = 0.0
+    confirmation_min_snr: float = 0.0
+    confirmation_min_core: float = 0.0
+    merge_distance_px: float = 0.0
+
+    @classmethod
+    def for_real_samples(cls) -> "DetectorConfig":
+        """真实样例的统一起始配置；没有按文件名、类别或坐标写检测规则。
+
+        圆周背景的尺度缩小，以跟随真实窄环。局部中值残差提供独立证据，
+        对其均值、噪声比及核心响应联合检查，抑制正常环形过渡与相位误差。
+        """
+        return cls(angular_sigma_px=4.0, edge_margin_px=6, seed_score=18.0,
+                   min_peak_contrast=28.0, min_area=4, confirmation_ksize=5,
+                   confirmation_min_mean=3.0, confirmation_min_snr=1.3,
+                   confirmation_min_core=5.0, merge_distance_px=4.0)
 
     def __post_init__(self) -> None:
         positive = (
@@ -66,7 +84,9 @@ class DetectorConfig:
             if not isfinite(value) or value <= 0:
                 raise ValueError(f"{name} 必须是有限正数")
         for name in ("center_search_radius_px", "center_exclusion_px",
-                     "min_pixel_contrast", "min_mean_contrast", "min_peak_contrast"):
+                     "min_pixel_contrast", "min_mean_contrast", "min_peak_contrast",
+                     "confirmation_min_mean", "confirmation_min_snr", "confirmation_min_core",
+                     "merge_distance_px"):
             value = getattr(self, name)
             if not isfinite(value) or value < 0:
                 raise ValueError(f"{name} 必须是有限非负数")
@@ -90,6 +110,8 @@ class DetectorConfig:
             or self.max_area < self.min_area
         ):
             raise ValueError("max_area 必须为 None 或不小于 min_area 的整数")
+        if self.confirmation_ksize not in (0, 3, 5):
+            raise ValueError("confirmation_ksize 必须为 0、3 或 5")
 
 
 @dataclass(frozen=True)
@@ -105,6 +127,9 @@ class Defect:
     mean_contrast: float
     peak_score: float
     touches_analysis_boundary: bool
+    confirmation_mean: float = 0.0
+    confirmation_snr: float = 0.0
+    confirmation_core_mean: float = 0.0
 
 
 @dataclass
@@ -183,6 +208,60 @@ def _circle_from_mask(mask: np.ndarray) -> WaferGeometry:
     return WaferGeometry(float(center[0]), float(center[1]), float(radius))
 
 
+def _circle_from_outer_rays(gray: np.ndarray, config: DetectorConfig) -> WaferGeometry | None:
+    """沿射线找最外侧可见边界，避免文字和彩色直边拉偏整个外轮廓。
+
+    这里只利用尺寸作宽松搜索约束，不固定 361×356、固定圆心或固定半径。
+    被图像裁掉的射线不参与拟合，剩余点通过迭代稳健圆拟合去掉离群点。
+    """
+    height, width = gray.shape
+    initial_x, initial_y = (width - 1) / 2, (height - 1) / 2
+    radii = np.arange(min(height, width) * .2, min(height, width) * .56, .25)
+    angles = np.linspace(0, 2 * np.pi, 720, endpoint=False)
+    map_x = (initial_x + np.cos(angles)[:, None] * radii).astype(np.float32)
+    map_y = (initial_y + np.sin(angles)[:, None] * radii).astype(np.float32)
+    smoothed = cv2.GaussianBlur(gray, (3, 3), .65)
+    samples = cv2.remap(smoothed, map_x, map_y, cv2.INTER_LINEAR,
+                        borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+    # 图像最外 2 像素可能是直线边框，不能作为晶圆的圆形边界点。
+    inside_frame = (map_x >= 2) & (map_x < width - 3) & (map_y >= 2) & (map_y < height - 3)
+    patch = max(2, min(10, min(height, width) // 20))
+    corners = np.concatenate((gray[:patch, :patch].ravel(), gray[:patch, -patch:].ravel(),
+                               gray[-patch:, :patch].ravel(), gray[-patch:, -patch:].ravel()))
+    black = float(np.median(corners))
+    threshold = black + max(4.0, config.foreground_threshold, 6 * _mad_sigma(corners, 0.0))
+    foreground = (samples > threshold) & inside_frame
+    indices = np.arange(len(radii))
+    last_foreground = np.max(np.where(foreground, indices, -1), axis=1)
+    last_visible = np.max(np.where(inside_frame, indices, -1), axis=1)
+    # 外边界后必须还能看到约 2 像素背景；否则该方向已被截图截断。
+    usable = (last_foreground >= 0) & (last_foreground < last_visible - 8)
+    if np.count_nonzero(usable) < 48:
+        return None
+    rows = np.flatnonzero(usable)
+    points = np.column_stack((map_x[rows, last_foreground[usable]],
+                               map_y[rows, last_foreground[usable]])).astype(np.float64)
+    for _ in range(5):
+        if len(points) < 32:
+            return None
+        origin = points.mean(axis=0)
+        centered = points - origin
+        design = np.column_stack((2 * centered, np.ones(len(points))))
+        solution, _, rank, _ = np.linalg.lstsq(design, (centered ** 2).sum(axis=1), rcond=None)
+        radius_squared = solution[2] + np.dot(solution[:2], solution[:2])
+        if rank < 3 or radius_squared <= 0:
+            return None
+        center = solution[:2] + origin
+        radius = float(np.sqrt(radius_squared))
+        errors = np.hypot(points[:, 0] - center[0], points[:, 1] - center[1]) - radius
+        median = np.median(errors)
+        tolerance = max(.5, 3 * _mad_sigma(errors, 0.0))
+        points = points[np.abs(errors - median) < tolerance]
+    if not (0 <= center[0] < width and 0 <= center[1] < height):
+        return None
+    return WaferGeometry(float(center[0]), float(center[1]), radius)
+
+
 def _prepare_roi(gray: np.ndarray, config: DetectorConfig,
                  geometry: WaferGeometry | None,
                  wafer_mask: np.ndarray | None) -> tuple[WaferGeometry, np.ndarray]:
@@ -200,6 +279,11 @@ def _prepare_roi(gray: np.ndarray, config: DetectorConfig,
         yy, xx = np.indices(gray.shape, dtype=np.float32)
         roi = np.hypot(xx - geometry.center_x, yy - geometry.center_y) <= geometry.radius
     else:
+        outer_circle = _circle_from_outer_rays(gray, config)
+        if outer_circle is not None:
+            yy, xx = np.indices(gray.shape, dtype=np.float32)
+            roi = np.hypot(xx - outer_circle.center_x, yy - outer_circle.center_y) <= outer_circle.radius
+            return outer_circle, roi
         # 默认边角为背景。先估计背景灰度与噪声，再提取最外侧可见轮廓。
         # 填充轮廓内部的黑环，防止把正常暗环误认为有效区域中的洞。
         patch = max(2, min(height, width) // 20)
@@ -367,7 +451,7 @@ def _estimate_noise(residual: np.ndarray, radius_map: np.ndarray,
     return noise
 
 
-def _extract_defects(residual: np.ndarray, noise: np.ndarray, mask: np.ndarray,
+def _extract_defects(gray: np.ndarray, residual: np.ndarray, noise: np.ndarray, mask: np.ndarray,
                      config: DetectorConfig) -> tuple[list[Defect], np.ndarray, np.ndarray]:
     """多尺度产生种子，原图残差产生连通域，分别处理亮点与暗点。"""
     positive_seeds = np.zeros(mask.shape, dtype=bool)
@@ -375,6 +459,10 @@ def _extract_defects(residual: np.ndarray, noise: np.ndarray, mask: np.ndarray,
     score_map = np.zeros(mask.shape, dtype=np.float32)
     weights = mask.astype(np.float32)
     variance = noise ** 2
+    # 第二种背景只用于复核候选，不替代沿圆周的背景。
+    # 中值滤波单独使用会破坏窄环，因此必须与圆环残差在同一区域相互印证。
+    confirmation = (gray - cv2.medianBlur(gray, config.confirmation_ksize)
+                    if config.confirmation_ksize else None)
 
     for size in config.scales:
         def box_sum(array: np.ndarray) -> np.ndarray:
@@ -417,6 +505,19 @@ def _extract_defects(residual: np.ndarray, noise: np.ndarray, mask: np.ndarray,
             peak = float(values.max())
             if peak < config.min_peak_contrast:
                 continue
+            confirmation_mean = confirmation_snr = confirmation_core = 0.0
+            if confirmation is not None:
+                # 使用整个连通域的有符号均值，正常相位错位的正负响应会抵消。
+                # 只取最大像素或只看 bbox 内最大值，容易被细环、边框或邻近点误导。
+                confirmation_mean = float(np.mean(sign * confirmation[region]))
+                local_sigma = float(np.median(noise[region]))
+                confirmation_snr = confirmation_mean / max(local_sigma, config.noise_floor)
+                core = region & (sign * residual >= .5 * peak)
+                confirmation_core = float(np.mean(sign * confirmation[core]))
+                if (confirmation_mean < config.confirmation_min_mean
+                        or confirmation_snr < config.confirmation_min_snr
+                        or confirmation_core < config.confirmation_min_core):
+                    continue
             defect_id = len(defects) + 1
             labels[region] = defect_id
             defects.append(Defect(
@@ -426,7 +527,32 @@ def _extract_defects(residual: np.ndarray, noise: np.ndarray, mask: np.ndarray,
                 peak_contrast=peak, mean_contrast=float(values.mean()),
                 peak_score=float(score_map[region].max()),
                 touches_analysis_boundary=bool(np.any(region & ~interior)),
+                confirmation_mean=confirmation_mean, confirmation_snr=confirmation_snr,
+                confirmation_core_mean=confirmation_core,
             ))
+    if config.merge_distance_px > 0 and defects:
+        # 同一个环状斑点可能同时有亮边和暗心。保留峰值对比度更强的候选，
+        # 合并相距很近且 bbox 相交的重复响应，避免一处缺陷被重复计数。
+        selected: list[Defect] = []
+        for defect in sorted(defects, key=lambda d: (-d.peak_contrast, d.id)):
+            x, y, width, height = defect.bbox_xywh
+            duplicate = False
+            for accepted in selected:
+                ax, ay, aw, ah = accepted.bbox_xywh
+                intersects = x < ax + aw and ax < x + width and y < ay + ah and ay < y + height
+                distance = np.hypot(defect.centroid_xy[0] - accepted.centroid_xy[0],
+                                     defect.centroid_xy[1] - accepted.centroid_xy[1])
+                if intersects and distance <= config.merge_distance_px:
+                    duplicate = True
+                    break
+            if not duplicate:
+                selected.append(defect)
+        merged_labels = np.zeros_like(labels)
+        defects = []
+        for new_id, defect in enumerate(selected, 1):
+            merged_labels[labels == defect.id] = new_id
+            defects.append(replace(defect, id=new_id))
+        labels = merged_labels
     return defects, labels, score_map
 
 
@@ -436,13 +562,14 @@ def detect(image: np.ndarray, config: DetectorConfig | None = None, *,
     """检测一张晶圆图，返回候选缺陷与所有关键中间结果。
 
     image: 0～255 灰度、BGR 或 BGRA，原图不被修改。
+    config: 省略时使用真实样例配置；显式 DetectorConfig() 是通用灵敏配置。
     geometry: 可传入已知的晶圆外轮廓，跳过自动外圆估计。
     wafer_mask: 可选的有效晶圆区域，0 表示无效，非零表示有效。
 
     限制：单图背景模型不能可靠区分小型中心同心结构与正中心缺陷；
-    默认排除中心半径 4 像素和外缘 4 像素。请检查 analysis_mask。
+    真实配置排除中心半径 4 像素和外缘约 6 像素。请检查 analysis_mask。
     """
-    config = config or DetectorConfig()
+    config = config if config is not None else DetectorConfig.for_real_samples()
     gray = _grayscale(image)
     if max(config.scales) > min(gray.shape):
         raise ValueError("检测尺度不能大于图像尺寸")
@@ -469,7 +596,7 @@ def detect(image: np.ndarray, config: DetectorConfig | None = None, *,
 
     # 阶段 C：噪声标准化、多尺度点检测、双阈值连通域提取。
     noise_map = _estimate_noise(residual, radius_map, analysis_mask, config)
-    defects, labels, score_map = _extract_defects(residual, noise_map, analysis_mask, config)
+    defects, labels, score_map = _extract_defects(gray, residual, noise_map, analysis_mask, config)
     return DetectionResult(defects, labels, analysis_mask, background, residual,
                             noise_map, score_map, radial_samples, radial_profile,
                             wafer_geometry, ring_center, config)

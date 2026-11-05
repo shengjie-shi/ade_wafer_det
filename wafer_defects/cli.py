@@ -13,15 +13,17 @@ from .io import read_image, save_result, write_png
 from .synthetic import PROFILES, make_wafer
 
 
-def _config(path: Path | None) -> DetectorConfig:
+def _config(path: Path | None, preset: str = "real") -> DetectorConfig:
+    settings = DetectorConfig.for_real_samples() if preset == "real" else DetectorConfig()
     if path is None:
-        return DetectorConfig()
+        return settings
     values = json.loads(path.read_text(encoding="utf-8-sig"))
     if not isinstance(values, dict):
         raise ValueError("配置文件必须是 JSON 对象")
     if "scales" in values:
         values["scales"] = tuple(values["scales"])
-    return DetectorConfig(**values)
+    from dataclasses import replace
+    return replace(settings, **values)
 
 
 def _demo(output: Path, config: DetectorConfig) -> None:
@@ -63,19 +65,33 @@ def main(argv: list[str] | None = None) -> int:
                            help="可选：手动指定晶圆外圆 x/y/半径")
     detection.add_argument("--mask", type=Path, help="可选：单通道有效晶圆掩膜，非零为有效")
     detection.add_argument("--config", type=Path, help="可选：JSON 参数文件")
+    detection.add_argument("--preset", choices=("real", "sensitive"), default="real",
+                           help="real 为本批真实图配置；sensitive 为低噪声模拟图的灵敏配置")
     demonstration = commands.add_parser("demo", help="生成四种环形模拟数据并运行检测")
     demonstration.add_argument("--output", type=Path, default=Path("output/demo"))
     demonstration.add_argument("--config", type=Path)
+    demonstration.add_argument("--preset", choices=("real", "sensitive"), default="sensitive")
+    batch = commands.add_parser("batch", help="递归检测小图文件夹，生成逐图对照页面")
+    batch.add_argument("input", type=Path)
+    batch.add_argument("--output", type=Path, default=Path("output/batch"))
+    batch.add_argument("--config", type=Path)
+    batch.add_argument("--preset", choices=("real", "sensitive"), default="real")
+    batch.add_argument("--evaluate-labels", action="store_true",
+                       help="仅在汇总时按两类文件夹评估；类别不传入检测算法")
     args = parser.parse_args(argv)
 
     try:
-        config = _config(args.config)
+        config = _config(args.config, args.preset)
         if args.command == "demo":
             _demo(args.output, config)
+        elif args.command == "batch":
+            from .evaluation import run_batch
+            report = run_batch(args.input, args.output, config, evaluate_labels=args.evaluate_labels)
+            print(json.dumps(report, ensure_ascii=True))
         else:
             # 禁止结果文件覆盖本次输入或掩膜。其他已有结果会被当前运行更新。
             reserved = {"input.png", "background.png", "residual.png", "analysis_mask.png",
-                        "defect_mask.png", "score.png", "overlay.png", "report.json", "intermediates.npz"}
+                        "defect_mask.png", "score.png", "overlay.png", "confirmation.png", "report.json", "intermediates.npz"}
             for source in (args.input, args.mask):
                 if (source is not None and source.resolve().parent == args.output.resolve()
                         and source.name.lower() in reserved):

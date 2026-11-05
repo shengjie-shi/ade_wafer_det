@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "gan-wafer-defects"
-version = "0.1.0"
+version = "0.2.0"
 description = "Offline, explainable detection of small anomalies on near-concentric wafer images"
 requires-python = ">=3.10"
 dependencies = ["numpy>=1.26,<3", "opencv-python-headless>=4.8,<5"]

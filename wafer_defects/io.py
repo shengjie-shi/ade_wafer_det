@@ -32,6 +32,24 @@ def write_png(path: str | Path, image: np.ndarray) -> None:
     encoded.tofile(path)
 
 
+def render_overlay(image: np.ndarray, result: DetectionResult) -> np.ndarray:
+    """绘制最终候选。采用编号和颜色，避免 OpenCV 字体把中文画成问号。"""
+    gray = np.clip(np.rint(_grayscale(image)), 0, 255).astype(np.uint8)
+    if gray.shape != result.labels.shape:
+        raise ValueError("结果尺寸与图像不一致")
+    overlay = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
+    overlay[~result.analysis_mask] = (overlay[~result.analysis_mask] * .3).astype(np.uint8)
+    for defect in result.defects:
+        x, y, width, height = defect.bbox_xywh
+        color = (20, 170, 250) if defect.polarity == "bright" else (250, 170, 20)
+        cv2.rectangle(overlay, (max(0, x - 3), max(0, y - 3)),
+                       (min(gray.shape[1] - 1, x + width + 2),
+                        min(gray.shape[0] - 1, y + height + 2)), color, 1)
+        cv2.putText(overlay, str(defect.id), (x + width + 4, max(12, y)),
+                    cv2.FONT_HERSHEY_SIMPLEX, .4, color, 1, cv2.LINE_AA)
+    return overlay
+
+
 def save_result(image: np.ndarray, result: DetectionResult, output_dir: str | Path) -> Path:
     """导出可视图、精确浮点中间结果与 JSON。显示图不用于再次检测。"""
     output = Path(output_dir)
@@ -51,17 +69,12 @@ def save_result(image: np.ndarray, result: DetectionResult, output_dir: str | Pa
     score_view = np.clip(result.score_map * 16, 0, 255).astype(np.uint8)
     write_png(output / "score.png", score_view)
 
-    overlay = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
-    overlay[~result.analysis_mask] = (overlay[~result.analysis_mask] * .3).astype(np.uint8)
-    for defect in result.defects:
-        x, y, width, height = defect.bbox_xywh
-        color = (20, 170, 250) if defect.polarity == "bright" else (250, 170, 20)
-        cv2.rectangle(overlay, (max(0, x - 3), max(0, y - 3)),
-                       (min(gray.shape[1] - 1, x + width + 2),
-                        min(gray.shape[0] - 1, y + height + 2)), color, 1)
-        cv2.putText(overlay, str(defect.id), (x + width + 4, max(12, y)),
-                    cv2.FONT_HERSHEY_SIMPLEX, .4, color, 1, cv2.LINE_AA)
-    write_png(output / "overlay.png", overlay)
+    write_png(output / "overlay.png", render_overlay(image, result))
+    if result.config.confirmation_ksize:
+        confirmation = _grayscale(image) - cv2.medianBlur(_grayscale(image), result.config.confirmation_ksize)
+        confirmation_view = np.clip(128 + 3 * confirmation, 0, 255).astype(np.uint8)
+        confirmation_view[~result.analysis_mask] = 0
+        write_png(output / "confirmation.png", confirmation_view)
 
     # NPZ 保留精确值；PNG 中的灰度截断及可视化增益不会丢失诊断数据。
     np.savez_compressed(output / "intermediates.npz", background=result.background,
@@ -70,7 +83,7 @@ def save_result(image: np.ndarray, result: DetectionResult, output_dir: str | Pa
                         labels=result.labels, radial_samples=result.radial_samples,
                         radial_profile=result.radial_profile)
     report = {
-        "notice": "数学背景模型产生的图像异常候选，尚未在厂内真实 GaN 数据上验证。",
+        "notice": "图像异常候选。真实图配置已在当前脱敏样例上调参核对；整图分类不能证明逐点零漏检，也不代表独立生产批次表现。",
         "image_size_wh": [gray.shape[1], gray.shape[0]],
         "coordinate_convention": "x=列，y=行；bbox_xywh 为左上角 x/y 和宽/高，原点为左上角 0/0。",
         "wafer_geometry": asdict(result.wafer_geometry),
